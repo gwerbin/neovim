@@ -491,6 +491,11 @@ function! s:python_exepath(invocation) abort
     \ . ' -c "import sys; sys.stdout.write(sys.executable)"'))
 endfunction
 
+" If true, the named file is a Python binary
+function! s:is_python_binary(filename)
+  return a:filename =~# '\v^python%([23]%(\.[0-9]+)?)?$'
+endfunction
+
 " Checks that $VIRTUAL_ENV Python executables are found at front of $PATH in
 " Nvim and subshells.
 function! s:check_virtualenv() abort
@@ -507,15 +512,17 @@ function! s:check_virtualenv() abort
   " subshells launched from Nvim.
   let bin_dir = has('win32') ? '/Scripts' : '/bin'
   let venv_bins = glob($VIRTUAL_ENV . bin_dir . '/python*', v:true, v:true)
-  " XXX: Remove irrelevant executables found in bin/.
-  let venv_bins = filter(venv_bins, 'v:val !~# "python-config"')
   if len(venv_bins)
     for venv_bin in venv_bins
+      if ! s:is_python_binary(fnamemodify(v:val, ":t"))
+        " XXX: Remove irrelevant executables found in bin/.
+        continue
+      endif
       let venv_bin = s:normalize_path(venv_bin)
       let py_bin_basename = fnamemodify(venv_bin, ':t')
       let nvim_py_bin = s:python_exepath(exepath(py_bin_basename))
       let subshell_py_bin = s:python_exepath(py_bin_basename)
-      if venv_bin !=# nvim_py_bin
+      if resolve(venv_bin) !=# nvim_py_bin
         call add(errors, '$PATH yields this '.py_bin_basename.' executable: '.nvim_py_bin)
         let hint = '$PATH ambiguities arise if the virtualenv is not '
           \.'properly activated prior to launching Nvim. Close Nvim, activate the virtualenv, '
