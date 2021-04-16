@@ -29,6 +29,7 @@
 #include "nvim/getchar.h"
 #include "nvim/mark.h"
 #include "nvim/mbyte.h"
+#include "nvim/memline.h"
 #include "nvim/message.h"
 #include "nvim/misc1.h"
 #include "nvim/garray.h"
@@ -119,6 +120,9 @@ struct source_cookie {
 /// batch mode debugging: don't save and restore typeahead.
 static bool debug_greedy = false;
 
+static char *debug_oldval = NULL;  // old and newval for debug expressions
+static char *debug_newval = NULL;
+
 /// Debug mode. Repeatedly get Ex commands, until told to continue normal
 /// execution.
 void do_debug(char_u *cmd)
@@ -165,6 +169,16 @@ void do_debug(char_u *cmd)
   if (!debug_did_msg) {
     MSG(_("Entering Debug mode.  Type \"cont\" to continue."));
   }
+  if (debug_oldval != NULL) {
+    smsg(_("Oldval = \"%s\""), debug_oldval);
+    xfree(debug_oldval);
+    debug_oldval = NULL;
+  }
+  if (debug_newval != NULL) {
+    smsg(_("Newval = \"%s\""), debug_newval);
+    xfree(debug_newval);
+    debug_newval = NULL;
+  }
   if (sourcing_name != NULL) {
     msg(sourcing_name);
   }
@@ -173,7 +187,6 @@ void do_debug(char_u *cmd)
   } else {
     smsg(_("cmd: %s"), cmd);
   }
-
   // Repeat getting a command and executing it.
   for (;; ) {
     msg_scroll = true;
@@ -513,11 +526,13 @@ bool dbg_check_skipped(exarg_T *eap)
 /// This is a grow-array of structs.
 struct debuggy {
   int dbg_nr;                   ///< breakpoint number
-  int dbg_type;                 ///< DBG_FUNC or DBG_FILE
-  char_u *dbg_name;             ///< function or file name
+  int dbg_type;                 ///< DBG_FUNC or DBG_FILE or DBG_EXPR
+  char_u *dbg_name;             ///< function, expression or file name
   regprog_T *dbg_prog;          ///< regexp program
   linenr_T dbg_lnum;            ///< line number in function or file
   int dbg_forceit;              ///< ! used
+  typval_T *dbg_val;            ///< last result of watchexpression
+  int dbg_level;                ///< stored nested level for expr
 };
 
 static garray_T dbg_breakp = { 0, 0, sizeof(struct debuggy), 4, NULL };
@@ -529,6 +544,7 @@ static int last_breakp = 0;     // nr of last defined breakpoint
 static garray_T prof_ga = { 0, 0, sizeof(struct debuggy), 4, NULL };
 #define DBG_FUNC        1
 #define DBG_FILE        2
+#define DBG_EXPR        3
 
 
 /// Parse the arguments of ":profile", ":breakadd" or ":breakdel" and put them
@@ -561,6 +577,8 @@ static int dbg_parsearg(char_u *arg, garray_T *gap)
     }
     bp->dbg_type = DBG_FILE;
     here = true;
+  } else if (gap != &prof_ga && STRNCMP(p, "expr", 4) == 0) {
+    bp->dbg_type = DBG_EXPR;
   } else {
     EMSG2(_(e_invarg2), p);
     return FAIL;
@@ -589,6 +607,9 @@ static int dbg_parsearg(char_u *arg, garray_T *gap)
     bp->dbg_name = vim_strsave(p);
   } else if (here) {
     bp->dbg_name = vim_strsave(curbuf->b_ffname);
+  } else if (bp->dbg_type == DBG_EXPR) {
+    bp->dbg_name = vim_strsave(p);
+    bp->dbg_val = eval_expr(bp->dbg_name);
   } else {
     // Expand the file name in the same way as do_source().  This means
     // doing it twice, so that $DIR/file gets expanded when $DIR is
@@ -620,7 +641,6 @@ static int dbg_parsearg(char_u *arg, garray_T *gap)
 void ex_breakadd(exarg_T *eap)
 {
   struct debuggy *bp;
-  char_u      *pat;
   garray_T    *gap;
 
   gap = &dbg_breakp;
@@ -632,22 +652,28 @@ void ex_breakadd(exarg_T *eap)
     bp = &DEBUGGY(gap, gap->ga_len);
     bp->dbg_forceit = eap->forceit;
 
-    pat = file_pat_to_reg_pat(bp->dbg_name, NULL, NULL, false);
-    if (pat != NULL) {
-      bp->dbg_prog = vim_regcomp(pat, RE_MAGIC + RE_STRING);
-      xfree(pat);
-    }
-    if (pat == NULL || bp->dbg_prog == NULL) {
-      xfree(bp->dbg_name);
+    if (bp->dbg_type != DBG_EXPR) {
+      char_u *pat = file_pat_to_reg_pat(bp->dbg_name, NULL, NULL, false);
+      if (pat != NULL) {
+        bp->dbg_prog = vim_regcomp(pat, RE_MAGIC + RE_STRING);
+        xfree(pat);
+      }
+      if (pat == NULL || bp->dbg_prog == NULL) {
+        xfree(bp->dbg_name);
+      } else {
+        if (bp->dbg_lnum == 0) {           // default line number is 1
+          bp->dbg_lnum = 1;
+        }
+        if (eap->cmdidx != CMD_profile) {
+          DEBUGGY(gap, gap->ga_len).dbg_nr = ++last_breakp;
+          debug_tick++;
+        }
+        gap->ga_len++;
+      }
     } else {
-      if (bp->dbg_lnum == 0) {           // default line number is 1
-        bp->dbg_lnum = 1;
-      }
-      if (eap->cmdidx != CMD_profile) {
-        DEBUGGY(gap, gap->ga_len).dbg_nr = ++last_breakp;
-        debug_tick++;
-      }
-      gap->ga_len++;
+      // DBG_EXPR
+      DEBUGGY(gap, gap->ga_len++).dbg_nr = ++last_breakp;
+      debug_tick++;
     }
   }
 }
@@ -690,7 +716,7 @@ void ex_breakdel(exarg_T *eap)
     todel = 0;
     del_all = true;
   } else {
-    // ":breakdel {func|file} [lnum] {name}"
+    // ":breakdel {func|file|expr} [lnum] {name}"
     if (dbg_parsearg(eap->arg, gap) == FAIL) {
       return;
     }
@@ -715,6 +741,10 @@ void ex_breakdel(exarg_T *eap)
   } else {
     while (!GA_EMPTY(gap)) {
       xfree(DEBUGGY(gap, todel).dbg_name);
+      if (DEBUGGY(gap, todel).dbg_type == DBG_EXPR
+          && DEBUGGY(gap, todel).dbg_val != NULL) {
+        tv_free(DEBUGGY(gap, todel).dbg_val);
+      }
       vim_regfree(DEBUGGY(gap, todel).dbg_prog);
       gap->ga_len--;
       if (todel < gap->ga_len) {
@@ -749,11 +779,15 @@ void ex_breaklist(exarg_T *eap)
       if (bp->dbg_type == DBG_FILE) {
         home_replace(NULL, bp->dbg_name, NameBuff, MAXPATHL, true);
       }
-      smsg(_("%3d  %s %s  line %" PRId64),
-           bp->dbg_nr,
-           bp->dbg_type == DBG_FUNC ? "func" : "file",
-           bp->dbg_type == DBG_FUNC ? bp->dbg_name : NameBuff,
-           (int64_t)bp->dbg_lnum);
+      if (bp->dbg_type != DBG_EXPR) {
+        smsg(_("%3d  %s %s  line %" PRId64),
+             bp->dbg_nr,
+             bp->dbg_type == DBG_FUNC ? "func" : "file",
+             bp->dbg_type == DBG_FUNC ? bp->dbg_name : NameBuff,
+             (int64_t)bp->dbg_lnum);
+      } else {
+        smsg(_("%3d  expr %s"), bp->dbg_nr, bp->dbg_name);
+      }
     }
   }
 }
@@ -813,6 +847,7 @@ debuggy_find(
     // an already found breakpoint.
     bp = &DEBUGGY(gap, i);
     if ((bp->dbg_type == DBG_FILE) == file
+        && bp->dbg_type != DBG_EXPR
         && (gap == &prof_ga
             || (bp->dbg_lnum > after && (lnum == 0 || bp->dbg_lnum < lnum)))) {
       // Save the value of got_int and reset it.  We don't want a
@@ -826,6 +861,46 @@ debuggy_find(
           *fp = bp->dbg_forceit;
         }
       }
+      got_int |= prev_got_int;
+    } else if (bp->dbg_type == DBG_EXPR) {
+      bool line = false;
+
+      prev_got_int = got_int;
+      got_int = false;
+
+      typval_T *tv = eval_expr(bp->dbg_name);
+      if (tv != NULL) {
+        if (bp->dbg_val == NULL) {
+          debug_oldval = typval_tostring(NULL);
+          bp->dbg_val = tv;
+          debug_newval = typval_tostring(bp->dbg_val);
+          line = true;
+        } else {
+          if (typval_compare(tv, bp->dbg_val, EXPR_IS, false) == OK
+              && tv->vval.v_number == false) {
+            line = true;
+            debug_oldval = typval_tostring(bp->dbg_val);
+            // Need to evaluate again, typval_compare() overwrites "tv".
+            typval_T *v = eval_expr(bp->dbg_name);
+            debug_newval = typval_tostring(v);
+            tv_free(bp->dbg_val);
+            bp->dbg_val = v;
+          }
+          tv_free(tv);
+        }
+      } else if (bp->dbg_val != NULL) {
+        debug_oldval = typval_tostring(bp->dbg_val);
+        debug_newval = typval_tostring(NULL);
+        tv_free(bp->dbg_val);
+        bp->dbg_val = NULL;
+        line = true;
+      }
+
+      if (line) {
+        lnum = after > 0 ? after : 1;
+        break;
+      }
+
       got_int |= prev_got_int;
     }
   }
@@ -2526,7 +2601,7 @@ void ex_pyxdo(exarg_T *eap)
   }
 }
 
-/// ":source {fname}"
+/// ":source [{fname}]"
 void ex_source(exarg_T *eap)
 {
   cmd_source(eap->arg, eap);
@@ -2534,8 +2609,8 @@ void ex_source(exarg_T *eap)
 
 static void cmd_source(char_u *fname, exarg_T *eap)
 {
-  if (*fname == NUL) {
-    EMSG(_(e_argreq));
+  if (eap != NULL && *fname == NUL) {
+    cmd_source_buffer(eap);
   } else if (eap != NULL && eap->forceit) {
     // ":source!": read Normal mode commands
     // Need to execute the commands directly.  This is required at least
@@ -2551,6 +2626,38 @@ static void cmd_source(char_u *fname, exarg_T *eap)
   } else if (do_source(fname, false, DOSO_NONE) == FAIL) {
     EMSG2(_(e_notopen), fname);
   }
+}
+
+typedef struct {
+  linenr_T curr_lnum;
+  const linenr_T final_lnum;
+} GetBufferLineCookie;
+
+/// Get one line from the current selection in the buffer.
+/// Called by do_cmdline() when it's called from cmd_source_buffer().
+///
+/// @return pointer to allocated line, or NULL for end-of-file or
+///         some error.
+static char_u *get_buffer_line(int c, void *cookie, int indent, bool do_concat)
+{
+  GetBufferLineCookie *p = cookie;
+  if (p->curr_lnum > p->final_lnum) {
+    return NULL;
+  }
+  char_u *curr_line = ml_get(p->curr_lnum);
+  p->curr_lnum++;
+  return (char_u *)xstrdup((const char *)curr_line);
+}
+
+static void cmd_source_buffer(const exarg_T *eap)
+  FUNC_ATTR_NONNULL_ALL
+{
+  GetBufferLineCookie cookie = {
+      .curr_lnum = eap->line1,
+      .final_lnum = eap->line2,
+  };
+  source_using_linegetter((void *)&cookie, get_buffer_line,
+                          ":source (no file)");
 }
 
 /// ":source" and associated commands.
@@ -2624,10 +2731,9 @@ static char_u *get_str_line(int c, void *cookie, int indent, bool do_concat)
   return (char_u *)xstrdup(buf);
 }
 
-/// Executes lines in `src` as Ex commands.
-///
-/// @see do_source()
-int do_source_str(const char *cmd, const char *traceback_name)
+static int source_using_linegetter(void *cookie,
+                                   LineGetter fgetline,
+                                   const char *traceback_name)
 {
   char_u *save_sourcing_name = sourcing_name;
   linenr_T save_sourcing_lnum = sourcing_lnum;
@@ -2642,20 +2748,31 @@ int do_source_str(const char *cmd, const char *traceback_name)
   }
   sourcing_lnum = 0;
 
-  GetStrLineCookie cookie = {
-    .buf = (char_u *)cmd,
-    .offset = 0,
-  };
   const sctx_T save_current_sctx = current_sctx;
   current_sctx.sc_sid = SID_STR;
   current_sctx.sc_seq = 0;
   current_sctx.sc_lnum = save_sourcing_lnum;
-  int retval = do_cmdline(NULL, get_str_line, (void *)&cookie,
+  funccal_entry_T entry;
+  save_funccal(&entry);
+  int retval = do_cmdline(NULL, fgetline, cookie,
                           DOCMD_VERBOSE | DOCMD_NOWAIT | DOCMD_REPEAT);
-  current_sctx = save_current_sctx;
   sourcing_lnum = save_sourcing_lnum;
   sourcing_name = save_sourcing_name;
+  current_sctx = save_current_sctx;
+  restore_funccal();
   return retval;
+}
+
+/// Executes lines in `src` as Ex commands.
+///
+/// @see do_source()
+int do_source_str(const char *cmd, const char *traceback_name)
+{
+  GetStrLineCookie cookie = {
+      .buf = (char_u *)cmd,
+      .offset = 0,
+  };
+  return source_using_linegetter((void *)&cookie, get_str_line, traceback_name);
 }
 
 /// Reads the file `fname` and executes its lines as Ex commands.
@@ -2982,6 +3099,7 @@ void scriptnames_slash_adjust(void)
 # endif
 
 /// Get a pointer to a script name.  Used for ":verbose set".
+/// Message appended to "Last set from "
 char_u *get_scriptname(LastSet last_set, bool *should_free)
 {
   *should_free = false;
@@ -2997,6 +3115,8 @@ char_u *get_scriptname(LastSet last_set, bool *should_free)
       return (char_u *)_("environment variable");
     case SID_ERROR:
       return (char_u *)_("error handler");
+    case SID_WINLAYOUT:
+      return (char_u *)_("changed window size");
     case SID_LUA:
       return (char_u *)_("Lua");
     case SID_API_CLIENT:

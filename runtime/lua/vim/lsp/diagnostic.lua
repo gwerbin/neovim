@@ -264,9 +264,15 @@ local function set_diagnostic_cache(diagnostics, bufnr, client_id)
   -- The diagnostic's severity. Can be omitted. If omitted it is up to the
   -- client to interpret diagnostics as error, warning, info or hint.
   -- TODO: Replace this with server-specific heuristics to infer severity.
+  local buf_line_count = vim.api.nvim_buf_line_count(bufnr)
   for _, diagnostic in ipairs(diagnostics) do
     if diagnostic.severity == nil then
       diagnostic.severity = DiagnosticSeverity.Error
+    end
+    -- Account for servers that place diagnostics on terminating newline
+    if buf_line_count > 0 then
+      local start = diagnostic.range.start
+      start.line = math.min(start.line, buf_line_count - 1)
     end
   end
 
@@ -1134,14 +1140,14 @@ function M.show_line_diagnostics(opts, bufnr, line_nr, client_id)
 
     local message_lines = vim.split(diagnostic.message, '\n', true)
     table.insert(lines, prefix..message_lines[1])
-    table.insert(highlights, {#prefix + 1, hiname})
+    table.insert(highlights, {#prefix, hiname})
     for j = 2, #message_lines do
       table.insert(lines, message_lines[j])
       table.insert(highlights, {0, hiname})
     end
   end
 
-  local popup_bufnr, winnr = util.open_floating_preview(lines, 'plaintext')
+  local popup_bufnr, winnr = util.open_floating_preview(lines, 'plaintext', opts)
   for i, hi in ipairs(highlights) do
     local prefixlen, hiname = unpack(hi)
     -- Start highlight after the prefix
@@ -1157,6 +1163,24 @@ local loclist_type_map = {
   [DiagnosticSeverity.Information] = 'I',
   [DiagnosticSeverity.Hint] = 'I',
 }
+
+
+--- Clear diagnotics and diagnostic cache
+---
+--- Handles saving diagnostics from multiple clients in the same buffer.
+---@param client_id number
+---@param buffer_client_map table map of buffers to active clients
+function M.reset(client_id, buffer_client_map)
+  buffer_client_map = vim.deepcopy(buffer_client_map)
+  vim.schedule(function()
+    for bufnr, client_ids in pairs(buffer_client_map) do
+      if client_ids[client_id] then
+        clear_diagnostic_cache(bufnr, client_id)
+        M.clear(bufnr, client_id)
+      end
+    end
+  end)
+end
 
 --- Sets the location list
 ---@param opts table|nil Configuration table. Keys:
